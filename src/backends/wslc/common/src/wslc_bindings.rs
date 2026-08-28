@@ -179,6 +179,18 @@ impl WslcSdk {
         ))
     }
 
+    /// True when the loaded WSLC runtime exports `WslcGetProcessIOHandle`.
+    ///
+    /// Deliberately NOT part of [`ensure_required_symbols`]: handle-mode exec
+    /// I/O (piped stdin forwarding, issue #804) is an optional capability with a
+    /// callback-mode fallback, so an older runtime that lacks the export must
+    /// degrade gracefully (no stdin forwarding) rather than fail SDK load.
+    /// Callers must check this before invoking `WslcGetProcessIOHandle` —
+    /// calling an unresolved symbol panics.
+    pub fn supports_process_io_handles(&self) -> bool {
+        self.WslcGetProcessIOHandle.is_ok()
+    }
+
     /// Raw `WslcTerminateSession` pointer, for the session RAII guard.
     pub fn terminate_session_fn(&self) -> SessionReleaseFn {
         *self

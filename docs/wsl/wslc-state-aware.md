@@ -73,6 +73,23 @@ A **successful** `exec` streams the script's raw stdout (relayed from the daemon
 and exits with the script's own exit code — it does **not** wrap the result in an envelope. Callers
 discriminate via the exit code + whether stdout parses as an envelope.
 
+### exec stdin semantics (issue #804)
+
+**Piped (non-TTY) stdin is forwarded** to the container process: `echo data | wxc-exec … exec` (or
+`exec < file`) streams the bytes into the process, and closing the pipe propagates **EOF** into the
+container (`cat` exits, `read` returns, etc.). Interactive **TTY** stdin is *not* forwarded — the
+client prints a warning and delivers immediate EOF instead (interactive PTY plumbing is a separate
+feature); redirect or pipe input to use stdin.
+
+Mechanics: the client pumps its stdin to the daemon as client→daemon `Stdin` stream frames (empty
+payload = EOF sentinel); the daemon runs the exec process in **handle mode** (no SDK I/O callbacks —
+`WslcGetProcessIOHandle` + reader/writer threads) so the stdin handle is available alongside live
+output. Handle-mode support is probed once per daemon (a no-op process on the first exec) and cached.
+On a runtime whose `wslcsdk.dll` lacks `WslcGetProcessIOHandle`, exec falls back to the original
+callback-mode I/O: output streaming is unchanged, stdin is not forwarded (the process sees immediate
+EOF), and the daemon logs a warning naming the missing capability. Stdin failures (process exited,
+stdin ignored, client gone) end the input stream but never fail the exec.
+
 ## Policy honor matrix
 
 WSLc networking is **all-or-nothing** (`WslcContainerNetworkingMode` `None` vs `Bridged`); there is

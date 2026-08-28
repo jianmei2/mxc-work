@@ -173,6 +173,24 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
         // output — prompts, spinners) so it isn't stranded in the line buffer.
         // This avoids a flush syscall per bulk chunk while preserving low latency.
         // Best-effort: a failed local write must not mask the container's exit code.
+        // Piped stdin is forwarded to the container (issue #804). Interactive
+        // TTY stdin is not (that is PTY plumbing, a separate feature): mirror
+        // the Windows Sandbox backend — warn, and hand the pump an empty source
+        // so the container process sees immediate EOF instead of hanging on a
+        // stdin that will never deliver.
+        let stdin_source: Box<dyn std::io::Read + Send> = {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                eprintln!(
+                    "[WSLC] warning: interactive terminal stdin is not forwarded to the \
+                     container; pipe or redirect input instead (e.g. `echo data | ...`)"
+                );
+                Box::new(std::io::empty())
+            } else {
+                Box::new(std::io::stdin())
+            }
+        };
+
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let exit_code = {
@@ -186,6 +204,7 @@ impl StatefulSandboxBackend for WslcStateAwareRunner {
                     env,
                     timeout_ms: request.script_timeout,
                 },
+                Some(stdin_source),
                 |stream, bytes| match stream {
                     OutStream::Stdout => {
                         let _ = out.write_all(bytes);

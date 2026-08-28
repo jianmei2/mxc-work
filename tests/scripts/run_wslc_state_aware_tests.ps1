@@ -212,7 +212,12 @@ function Invoke-StateAwareStreaming {
     param(
         [string]$ConfigFile,
         [hashtable]$Request,
-        [string]$SandboxId
+        [string]$SandboxId,
+        # When supplied, redirect wxc-exec's stdin, write this string, then
+        # close it -- exercising the exec stdin-forwarding path (issue #804).
+        # wxc-exec sees a piped (non-TTY) stdin, so the client pumps it to the
+        # daemon as Stdin frames and closing it propagates EOF to the container.
+        [string]$StdinData
     )
 
     if ($ConfigFile) {
@@ -246,11 +251,17 @@ function Invoke-StateAwareStreaming {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    if ($PSBoundParameters.ContainsKey('StdinData')) { $psi.RedirectStandardInput = $true }
     $psi.CreateNoWindow = $true
 
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
     $null = $proc.Start()
+
+    if ($psi.RedirectStandardInput) {
+        $proc.StandardInput.Write($StdinData)
+        $proc.StandardInput.Close()
+    }
 
     # Drain stderr async so a large stderr can never deadlock the stdout read.
     $stderrTask = $proc.StandardError.ReadToEndAsync()
@@ -456,6 +467,24 @@ try {
                 Assert-True ($gapSec -ge $dripMinGapSec) `
                     ("PART1 arrived >={0:N1}s before PART2 (gap {1:N2}s, sleep {2:N1}s) -- streamed live, not buffered" -f $dripMinGapSec, $gapSec, $dripSleepSec)
             }
+        } | Out-Null
+    }
+
+    # A3c: STDIN ROUND-TRIP (issue #804) -- pipe bytes into the exec and prove
+    # (1) they reach the container process and (2) closing our stdin propagates
+    # EOF into the container. `cat` echoes exactly what it reads and exits only
+    # when its stdin closes, so a 0 exit + echoed marker proves both directions
+    # in one run. On a runtime without handle-mode exec I/O (no
+    # WslcGetProcessIOHandle) the daemon logs a warning and runs without stdin;
+    # `cat` then sees immediate EOF and echoes nothing, so this test fails
+    # loudly on the fallback path rather than hanging.
+    if ($execedOk) {
+        Run-StateAwareTest "A: exec (stdin round-trip, #804)" {
+            $marker = 'wslc-stdin-roundtrip-marker'
+            $r = Invoke-StateAwareStreaming -ConfigFile 'wslc_state_aware_exec_stdin.json' `
+                -SandboxId $script:sandboxId -StdinData "$marker`n"
+            Assert-True ($r.ExitCode -eq 0) "exit code = 0 (cat exited on forwarded stdin EOF)"
+            Assert-True ($r.Stdout -match $marker) "stdout echoes the bytes piped to stdin"
         } | Out-Null
     }
 

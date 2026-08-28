@@ -897,19 +897,479 @@ pub struct ExecOutcome {
     pub stderr: Vec<u8>,
 }
 
+/// Blocking pull source for bytes to forward to an exec process's stdin.
+///
+/// Each call returns the next chunk: `Some(non-empty)` = data, `Some(empty)` or
+/// `None` = end-of-input (the forwarder closes the container-side stdin handle,
+/// delivering EOF to the process). The callee may block awaiting more input; it
+/// is always invoked from a dedicated forwarder thread, never an SDK or async
+/// runtime thread. The daemon wraps its per-exec tokio channel in one of these
+/// so this crate stays runtime-agnostic.
+pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
+
+/// How an exec process's I/O is plumbed. The two modes exist because the WSLc
+/// SDK makes callbacks and handles mutually exclusive per process ("Using any
+/// callbacks will consume the IO handles" — `wslcsdk.h`):
+///
+/// * [`Handles`](ExecIoMode::Handles) — no SDK callbacks; stdout/stderr are
+///   drained by `ReadFile` threads and **stdin is forwarded** via a `WriteFile`
+///   thread (issue #804). Requires a runtime whose `wslcsdk.dll` exports
+///   `WslcGetProcessIOHandle` (probe with
+///   [`probe_process_io_handles`] / `WslcSdk::supports_process_io_handles`).
+/// * [`Callbacks`](ExecIoMode::Callbacks) — the original SDK-callback path.
+///   Stdin cannot be forwarded; a provided [`StdinSource`] is ignored with a
+///   logged warning. Kept as the fallback for older runtimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecIoMode {
+    Handles,
+    Callbacks,
+}
+
+/// A raw process-I/O `HANDLE` moved into a forwarder thread. `HANDLE` is a raw
+/// pointer and thus `!Send` by default; kernel handles are process-global, so
+/// crossing threads is sound. The receiving thread assumes ownership and is
+/// responsible for `CloseHandle`.
+struct SendHandle(HANDLE);
+// SAFETY: a Win32 kernel HANDLE is valid on any thread of the process; only the
+// spawned forwarder thread uses (and closes) it after the move.
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    /// Accessor rather than direct `.0` field use inside spawned closures: Rust
+    /// 2021 disjoint capture would otherwise capture the raw-pointer *field*
+    /// (`!Send`) instead of the `Send` wrapper.
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+/// Runtime capability probe for handle-mode exec I/O: runs a no-op process in
+/// `container` with no callbacks registered and checks whether the runtime can
+/// actually surface its I/O handles. A symbol-presence check
+/// (`WslcSdk::supports_process_io_handles`) alone is not sufficient — SDK
+/// headers (and even exports) may run ahead of what the shipping runtime
+/// implements — and probing on the *real* exec process would be unsafe: by the
+/// time acquisition fails the user's command is already running, and killing it
+/// could leave side effects. The daemon calls this once per session and caches
+/// the answer.
+///
+/// # Safety
+/// `sdk` must hold valid function pointers and `container` must be a live,
+/// started handle.
+pub unsafe fn probe_process_io_handles(
+    sdk: &WslcSdk,
+    container: WslcContainer,
+    logger: &mut Logger,
+) -> bool {
+    if !sdk.supports_process_io_handles() {
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] runtime does not export WslcGetProcessIOHandle — \
+             exec uses callback I/O (stdin forwarding unavailable)"
+        );
+        return false;
+    }
+
+    let mut settings = match ProcessSettings::build_detached(sdk, ":", &[], "") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut process: WslcProcess = ptr::null_mut();
+    let mut err_msg = CoTaskMemPWSTR::null();
+    let hr = sdk.WslcCreateContainerProcess(
+        container,
+        settings.raw_mut(),
+        &mut process,
+        err_msg.as_mut_ptr(),
+    );
+    if hr != S_OK {
+        return false;
+    }
+    let process_guard = WslcProcessGuard::from_raw(process, sdk.release_process_fn());
+    settings.mark_process_created();
+
+    // Acquire-and-close each stream's handle. Success on all three is the
+    // capability signal; the handles themselves are not reused (the probe's
+    // no-op emits nothing).
+    let mut supported = true;
+    for io in [
+        WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDIN,
+        WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDOUT,
+        WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDERR,
+    ] {
+        let mut handle: HANDLE = ptr::null_mut();
+        let hr = sdk.WslcGetProcessIOHandle(process_guard.as_raw(), io, &mut handle);
+        if hr != S_OK || handle.is_null() {
+            supported = false;
+            break;
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+            handle,
+        ));
+    }
+
+    // Bounded wait for the no-op to finish so the probe never strands a
+    // process; ignore the outcome — only handle acquisition matters.
+    let mut exit_event: HANDLE = ptr::null_mut();
+    if sdk.WslcGetProcessExitEvent(process_guard.as_raw(), &mut exit_event) == S_OK
+        && !exit_event.is_null()
+    {
+        let _ = windows::Win32::System::Threading::WaitForSingleObject(
+            windows::Win32::Foundation::HANDLE(exit_event),
+            5_000,
+        );
+    }
+
+    let _ = writeln!(
+        logger,
+        "[WSLC][daemon] handle-mode exec I/O {}",
+        if supported {
+            "available — stdin forwarding enabled"
+        } else {
+            "unavailable at runtime — exec uses callback I/O (stdin forwarding disabled)"
+        }
+    );
+    supported
+}
+
 /// Run `script_code` (under `/bin/sh -c`) as a fresh process inside a started
 /// daemon container and wait for it to complete. On timeout the *process* is
 /// killed (SIGKILL) — NOT the container — so the keepalive init survives for
 /// subsequent execs.
 ///
+/// `io_mode` selects the I/O plumbing (see [`ExecIoMode`]); pass
+/// [`ExecIoMode::Handles`] only after [`probe_process_io_handles`] confirmed
+/// runtime support. `stdin`, when provided in handle mode, is drained by a
+/// forwarder thread into the process's stdin; end-of-input closes the
+/// container-side handle so the process observes EOF. Forwarding failures
+/// (process exited, stdin ignored) close the stream but never fail the exec —
+/// mirroring the Windows Sandbox backend's stdin bridging semantics.
+///
 /// # Safety
 /// `sdk` must hold valid function pointers and `container` must be a live,
 /// started handle.
 // A thin FFI primitive whose parameters mirror the SDK's process inputs plus
-// the optional live-output sink; grouping them into a struct would only add an
-// indirection for a single call site.
+// the optional live-output sink and stdin source; grouping them into a struct
+// would only add an indirection for a single call site.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn exec_in_container(
+    sdk: &WslcSdk,
+    container: WslcContainer,
+    script_code: &str,
+    env: &[String],
+    working_directory: &str,
+    timeout_ms: u32,
+    sink: Option<OutputSink>,
+    stdin: Option<StdinSource>,
+    io_mode: ExecIoMode,
+    logger: &mut Logger,
+) -> Result<ExecOutcome, ScriptResponse> {
+    match io_mode {
+        ExecIoMode::Handles => exec_via_handles(
+            sdk,
+            container,
+            script_code,
+            env,
+            working_directory,
+            timeout_ms,
+            sink,
+            stdin,
+            logger,
+        ),
+        ExecIoMode::Callbacks => {
+            if stdin.is_some() {
+                let _ = writeln!(
+                    logger,
+                    "[WSLC][daemon] Warning: client stdin is not forwarded — the runtime \
+                     lacks handle-mode exec I/O (WslcGetProcessIOHandle); see issue #804"
+                );
+            }
+            exec_via_callbacks(
+                sdk,
+                container,
+                script_code,
+                env,
+                working_directory,
+                timeout_ms,
+                sink,
+                logger,
+            )
+        }
+    }
+}
+
+/// Handle-mode exec (issue #804): registers **no** SDK callbacks, acquires the
+/// process's stdin/stdout/stderr handles via `WslcGetProcessIOHandle`, and pumps
+/// them with dedicated threads — `ReadFile` for output (feeding the capped
+/// capture buffers + live sink, exactly like the callback path), `WriteFile`
+/// draining `stdin`. Exit is confirmed by `WslcGetProcessExitEvent`; output
+/// flush is confirmed by the reader threads reaching EOF (the SDK closes the
+/// pipes when the process ends).
+#[allow(clippy::too_many_arguments)]
+unsafe fn exec_via_handles(
+    sdk: &WslcSdk,
+    container: WslcContainer,
+    script_code: &str,
+    env: &[String],
+    working_directory: &str,
+    timeout_ms: u32,
+    sink: Option<OutputSink>,
+    stdin: Option<StdinSource>,
+    logger: &mut Logger,
+) -> Result<ExecOutcome, ScriptResponse> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE as WinHandle};
+    use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+
+    // No callbacks: the settings share no IoContext with the SDK, so none of the
+    // callback path's Arc-reference/leak choreography applies here.
+    let mut process_settings =
+        ProcessSettings::build_detached(sdk, script_code, env, working_directory)?;
+
+    let mut process: WslcProcess = ptr::null_mut();
+    let mut err_msg = CoTaskMemPWSTR::null();
+    let hr = sdk.WslcCreateContainerProcess(
+        container,
+        process_settings.raw_mut(),
+        &mut process,
+        err_msg.as_mut_ptr(),
+    );
+    if hr != S_OK {
+        let msg = err_msg.to_string_lossy();
+        return Err(sdk_error("WslcCreateContainerProcess failed", hr, &msg));
+    }
+    let process_guard = WslcProcessGuard::from_raw(process, sdk.release_process_fn());
+    process_settings.mark_process_created();
+
+    // Acquire all three I/O handles up front. Failure here is unexpected — the
+    // session-level probe validated the capability — so treat it as a launch
+    // failure: kill the just-created process (it has barely started; a probe-
+    // gated runtime that suddenly cannot surface handles is an SDK anomaly) and
+    // report the error rather than silently running with lost output.
+    let acquire = |io: WslcProcessIOHandle, name: &str| -> Result<HANDLE, ScriptResponse> {
+        let mut handle: HANDLE = ptr::null_mut();
+        let hr = sdk.WslcGetProcessIOHandle(process_guard.as_raw(), io, &mut handle);
+        if hr != S_OK || handle.is_null() {
+            let _ = sdk.WslcSignalProcess(process_guard.as_raw(), WslcSignal::WSLC_SIGNAL_SIGKILL);
+            return Err(sdk_error(
+                &format!("WslcGetProcessIOHandle({name}) failed"),
+                hr,
+                "",
+            ));
+        }
+        Ok(handle)
+    };
+    let stdin_handle = acquire(WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDIN, "stdin")?;
+    let stdout_handle = acquire(
+        WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDOUT,
+        "stdout",
+    )?;
+    let stderr_handle = acquire(
+        WslcProcessIOHandle::WSLC_PROCESS_IO_HANDLE_STDERR,
+        "stderr",
+    )?;
+
+    let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: Option<Arc<OutputSink>> = sink.map(Arc::new);
+
+    // Output readers: one thread per stream, running until EOF (process exit
+    // closes the pipe) or a read error. Each signals `readers_done` on exit —
+    // that signal is the handle-mode equivalent of the callback path's
+    // exit-callback flush proof.
+    let (readers_done_tx, readers_done_rx) = std::sync::mpsc::channel::<()>();
+    let spawn_reader = |handle: HANDLE, kind: OutStream, buf: Arc<Mutex<Vec<u8>>>| {
+        let sink = sink.clone();
+        let done = readers_done_tx.clone();
+        let moved = SendHandle(handle);
+        std::thread::spawn(move || {
+            let handle = WinHandle(moved.raw());
+            let mut chunk = [0u8; 8192];
+            loop {
+                let mut read: u32 = 0;
+                // SAFETY: `handle` is a live pipe handle owned by this thread;
+                // `chunk`/`read` outlive the call.
+                let result = ReadFile(handle, Some(&mut chunk), Some(&mut read), None);
+                if result.is_err() || read == 0 {
+                    // EOF or broken pipe: the process ended (or the runtime tore
+                    // the pipe down) — either way this stream is complete.
+                    break;
+                }
+                let bytes = &chunk[..read as usize];
+                {
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    append_capped(&mut b, bytes);
+                }
+                if let Some(sink) = &sink {
+                    sink(kind, bytes);
+                }
+            }
+            let _ = CloseHandle(handle);
+            let _ = done.send(());
+        });
+    };
+    spawn_reader(stdout_handle, OutStream::Stdout, Arc::clone(&stdout_buf));
+    spawn_reader(stderr_handle, OutStream::Stderr, Arc::clone(&stderr_buf));
+    drop(readers_done_tx);
+
+    // Stdin forwarder: drain the source into the process until end-of-input
+    // (empty chunk / closed source), then close the handle so the process sees
+    // EOF. A write failure means the process exited or closed its stdin — stop
+    // forwarding, never fail the exec. With no source, close immediately:
+    // a process that reads stdin gets instant EOF instead of hanging forever.
+    {
+        let moved = SendHandle(stdin_handle);
+        match stdin {
+            Some(mut source) => {
+                std::thread::spawn(move || {
+                    let handle = WinHandle(moved.raw());
+                    'outer: while let Some(bytes) = source() {
+                        if bytes.is_empty() {
+                            break; // protocol EOF sentinel
+                        }
+                        let mut offset = 0;
+                        while offset < bytes.len() {
+                            let mut written: u32 = 0;
+                            // SAFETY: live handle owned by this thread; buffers
+                            // outlive the call.
+                            let result =
+                                WriteFile(handle, Some(&bytes[offset..]), Some(&mut written), None);
+                            if result.is_err() || written == 0 {
+                                break 'outer;
+                            }
+                            offset += written as usize;
+                        }
+                    }
+                    let _ = CloseHandle(handle);
+                });
+            }
+            None => {
+                let _ = CloseHandle(WinHandle(moved.0));
+            }
+        }
+    }
+
+    // Exit wait: identical semantics to the callback path — bounded wait on the
+    // SDK's exit event, SIGKILL the process (not the container) on timeout.
+    let mut exit_event: HANDLE = ptr::null_mut();
+    let hr = sdk.WslcGetProcessExitEvent(process_guard.as_raw(), &mut exit_event);
+    if hr != S_OK {
+        return Err(sdk_error("WslcGetProcessExitEvent failed", hr, ""));
+    }
+    let wait_ms = if timeout_ms > 0 { timeout_ms } else { u32::MAX };
+
+    let mut timed_out = false;
+    let mut exit_signalled = false;
+    let mut terminated_unconfirmed = false;
+
+    if !exit_event.is_null() {
+        let wait_result = windows::Win32::System::Threading::WaitForSingleObject(
+            windows::Win32::Foundation::HANDLE(exit_event),
+            wait_ms,
+        );
+        if wait_result == windows::Win32::Foundation::WAIT_OBJECT_0 {
+            exit_signalled = true;
+        } else if wait_result == windows::Win32::Foundation::WAIT_TIMEOUT {
+            timed_out = true;
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] exec timeout ({}ms) reached — killing process",
+                wait_ms
+            );
+            let kill_hr =
+                sdk.WslcSignalProcess(process_guard.as_raw(), WslcSignal::WSLC_SIGNAL_SIGKILL);
+            if kill_hr != S_OK {
+                let _ = writeln!(
+                    logger,
+                    "[WSLC][daemon] Warning: WslcSignalProcess(SIGKILL) failed (hr=0x{:08X}); \
+                     process may still be running",
+                    kill_hr as u32
+                );
+            }
+        } else {
+            let last_error = windows::Win32::Foundation::GetLastError();
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Warning: waiting on the exec exit event failed: \
+                 WaitForSingleObject returned 0x{:08X} (GetLastError 0x{:08X}); \
+                 container state is unknown",
+                wait_result.0, last_error.0
+            );
+            terminated_unconfirmed = true;
+        }
+    }
+
+    // Flush proof: both readers reaching EOF is the evidence that the process
+    // is gone AND its output is fully drained (the pipes only close when the
+    // process ends). Bounded like the callback path's exit-callback wait, with
+    // the same one extra grace period after a timeout SIGKILL.
+    let wait_readers = |deadline: Duration| -> bool {
+        for _ in 0..2 {
+            if readers_done_rx.recv_timeout(deadline).is_err() {
+                return false;
+            }
+        }
+        true
+    };
+    let mut confirmed = wait_readers(Duration::from_secs(30));
+    if timed_out && !confirmed {
+        confirmed = wait_readers(Duration::from_secs(30));
+        if !confirmed {
+            let _ = writeln!(
+                logger,
+                "[WSLC][daemon] Warning: output streams did not close after the timeout \
+                 SIGKILL; process may still be running"
+            );
+        }
+    }
+
+    let mut exit_code: i32 = -1;
+    let hr = sdk.WslcGetProcessExitCode(process_guard.as_raw(), &mut exit_code);
+    if hr != S_OK && !timed_out {
+        return Err(sdk_error("WslcGetProcessExitCode failed", hr, ""));
+    }
+
+    let stdout = stdout_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stderr = stderr_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    if timed_out {
+        if confirmed {
+            let _ = writeln!(logger, "[WSLC][daemon] Process killed after timeout");
+        } else {
+            terminated_unconfirmed = true;
+        }
+    } else if exit_signalled || confirmed {
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] Process exited with code {}",
+            exit_code
+        );
+    } else {
+        let _ = writeln!(
+            logger,
+            "[WSLC][daemon] Warning: exec never reported an exit (no exit event, no \
+             stream EOF); container state is unknown"
+        );
+        terminated_unconfirmed = true;
+    }
+
+    Ok(ExecOutcome {
+        exit_code: if timed_out || terminated_unconfirmed {
+            -1
+        } else {
+            exit_code
+        },
+        timed_out,
+        terminated_unconfirmed,
+        stdout,
+        stderr,
+    })
+}
+
+/// Callback-mode exec: the original SDK-callback I/O path, retained as the
+/// fallback for runtimes without `WslcGetProcessIOHandle`. Stdin cannot be
+/// forwarded on this path (see [`ExecIoMode`]).
+#[allow(clippy::too_many_arguments)]
+unsafe fn exec_via_callbacks(
     sdk: &WslcSdk,
     container: WslcContainer,
     script_code: &str,

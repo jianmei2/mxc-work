@@ -420,20 +420,57 @@ async fn handle_client(mut pipe: NamedPipeServer, session: SessionHandle) -> Res
 /// [`DaemonResponse::Err`] rather than a post-admission stream `Error` frame.
 ///
 /// Output streaming (process -> `Stdout`/`Stderr`) is live. Client `Stdin`
-/// frames are NOT forwarded: the WSLc SDK consumes all process IO handles once
-/// any `WslcSetProcessSettingsCallbacks` is registered (the callback path this
-/// live output streaming depends on), so `WslcGetProcessIOHandle(STDIN)` is
-/// unavailable. Piped stdin would require a handle-mode rearchitecture (no
-/// callbacks; `ReadFile` threads for stdout/stderr + `WriteFile` for stdin) and
-/// is deferred; stdin forwarding is tracked in issue #804.
+/// frames ARE forwarded (issue #804) when the runtime supports handle-mode exec
+/// I/O: a dedicated pump task reads post-admission frames off the connection's
+/// read half and feeds `Stdin` payloads (empty = EOF) to the worker's
+/// stdin-forwarder thread over a bounded channel. The pump is a separate task —
+/// never a select arm in the output loop — so a full stdin channel
+/// backpressures only the client's stdin stream and can never stall output or
+/// the terminal frame. Stdin errors (protocol violation, client gone, run
+/// already over) end input but never fail the exec, mirroring the Windows
+/// Sandbox backend. On a runtime without `WslcGetProcessIOHandle` the worker
+/// runs callback-mode I/O and drops the stdin receiver — the pump then stops on
+/// its first failed send and the run proceeds without stdin, as before.
 async fn handle_exec(
-    mut pipe: NamedPipeServer,
+    pipe: NamedPipeServer,
     session: SessionHandle,
     config: wslc_common::daemon_protocol::ExecConfig,
 ) -> Result<()> {
     // Await the worker's admission decision before writing anything: a rejected
     // exec is a pre-admission typed error, never a post-admission stream frame.
-    write_exec_result(&mut pipe, session.exec(config).await).await
+    let admission = session.exec(config).await;
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+
+    // Client stdin pump. Holds the only long-lived clone of the stdin sender:
+    // `write_exec_result` drops the struct's copy at destructure, so when the
+    // pump ends (EOF sentinel, client disconnect, abort below) the channel
+    // closes and the worker's forwarder delivers EOF to the process.
+    let pump = admission.as_ref().ok().map(|stream| {
+        let stdin_tx = stream.stdin.clone();
+        tokio::spawn(async move {
+            // A non-Stdin frame mid-exec is a protocol violation, and a read
+            // error means the client is gone — both fall out of the loop and
+            // end stdin without failing the exec.
+            while let Ok(StreamFrame::Stdin { data }) =
+                read_frame::<_, StreamFrame>(&mut reader).await
+            {
+                if data.is_empty() {
+                    break; // client EOF sentinel
+                }
+                if stdin_tx.send(data).await.is_err() {
+                    break; // run finished, or callback-mode worker dropped the receiver
+                }
+            }
+        })
+    });
+
+    let result = write_exec_result(&mut writer, admission).await;
+    if let Some(pump) = pump {
+        // The run is over and its terminal frame written; nothing further to
+        // forward. Aborting also drops the pump's stdin sender.
+        pump.abort();
+    }
+    result
 }
 
 /// Turn an exec **admission** outcome into the client's frame sequence, generic
@@ -450,6 +487,10 @@ async fn write_exec_result<S: AsyncWrite + Unpin>(
         done,
         mut output,
         overflowed,
+        // Dropped here by design: the stdin pump task holds its own clone of
+        // the sender (see `handle_exec`), so input stays open exactly as long
+        // as the pump runs.
+        stdin: _,
     } = match admission {
         Ok(stream) => stream,
         Err(e) => {
@@ -590,6 +631,12 @@ mod tests {
 
     /// Admit an exec whose output channel is already closed (no live output),
     /// so `write_exec_result` goes straight from `Ok` to the terminal frame.
+    /// Stdin sender for tests: `write_exec_result` drops it at destructure and
+    /// these tests spawn no pump task, so a dangling sender is all that's needed.
+    fn dummy_stdin() -> mpsc::Sender<Vec<u8>> {
+        mpsc::channel(1).0
+    }
+
     fn admitted_no_output(
         done: oneshot::Receiver<Result<i32, WorkerError>>,
     ) -> Result<ExecStream, WorkerError> {
@@ -599,6 +646,7 @@ mod tests {
             done,
             output,
             overflowed: Arc::new(AtomicBool::new(false)),
+            stdin: dummy_stdin(),
         })
     }
 
@@ -723,6 +771,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed: Arc::new(AtomicBool::new(false)),
+                stdin: dummy_stdin(),
             }),
         )
         .await
@@ -782,6 +831,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed: Arc::new(AtomicBool::new(false)),
+                stdin: dummy_stdin(),
             }),
         )
         .await
@@ -855,6 +905,7 @@ mod tests {
                     done: done_rx,
                     output,
                     overflowed: Arc::new(AtomicBool::new(false)),
+                    stdin: dummy_stdin(),
                 }),
             ),
         )
@@ -908,6 +959,7 @@ mod tests {
                 done: done_rx,
                 output,
                 overflowed,
+                stdin: dummy_stdin(),
             }),
         )
         .await

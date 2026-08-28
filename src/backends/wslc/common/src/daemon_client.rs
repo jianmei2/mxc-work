@@ -301,7 +301,7 @@ impl DaemonClient {
     pub fn exec(&self, config: ExecConfig) -> DaemonResult<ExecResult> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit_code = self.exec_streaming(config, |stream, data| match stream {
+        let exit_code = self.exec_streaming(config, None, |stream, data| match stream {
             OutStream::Stdout => stdout.extend_from_slice(data),
             OutStream::Stderr => stderr.extend_from_slice(data),
         })?;
@@ -321,9 +321,20 @@ impl DaemonClient {
     /// callback until the terminal [`StreamFrame::Exit`] (or
     /// [`StreamFrame::Error`]). Unlike [`exec`](Self::exec), nothing is buffered
     /// here — the caller decides what to do with each chunk.
+    ///
+    /// `stdin`, when provided, is pumped to the daemon as client→daemon
+    /// [`StreamFrame::Stdin`] frames by a detached thread (issue #804): chunks
+    /// as they are read, then one empty payload as the end-of-input sentinel.
+    /// The pipe is duplex and the pump is the connection's only writer after
+    /// the request frame, so frames never interleave. The thread is detached
+    /// because a blocking `Read` (e.g. the process's own stdin) cannot be
+    /// interrupted — it exits on source EOF, on a write failure, or with the
+    /// process. A daemon on a runtime without handle-mode exec I/O reads and
+    /// discards these frames (the run simply sees no stdin, as before #804).
     pub fn exec_streaming(
         &self,
         config: ExecConfig,
+        stdin: Option<Box<dyn Read + Send + 'static>>,
         mut on_output: impl FnMut(OutStream, &[u8]),
     ) -> DaemonResult<i32> {
         let mut pipe = self.open_pipe()?;
@@ -339,6 +350,32 @@ impl DaemonClient {
                     "unexpected exec admission reply: {other:?}"
                 )))
             }
+        }
+
+        // Stdin pump — started only after admission, so a rejected exec never
+        // spawns a reader of the caller's stdin.
+        if let Some(mut source) = stdin {
+            let mut writer = pipe
+                .try_clone()
+                .context("clone daemon pipe for stdin pump")?;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match source.read(&mut buf) {
+                        // Source EOF or read error: fall through to the EOF frame.
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let data = buf[..n].to_vec();
+                            if write_frame(&mut writer, &StreamFrame::Stdin { data }).is_err() {
+                                // Daemon/pipe gone — the exec is over (or the
+                                // connection died); nothing more to send.
+                                return;
+                            }
+                        }
+                    }
+                }
+                let _ = write_frame(&mut writer, &StreamFrame::Stdin { data: Vec::new() });
+            });
         }
 
         loop {

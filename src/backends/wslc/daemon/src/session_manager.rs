@@ -126,6 +126,13 @@ pub enum WorkerCommand {
         /// stdout/stderr callbacks push chunks through it to the pipe handler as
         /// bytes arrive, alongside the capped capture buffers.
         sink: OutputSink,
+        /// Client stdin chunks for the run (issue #804). The pipe handler feeds
+        /// decoded `StreamFrame::Stdin` payloads in; the worker wraps the
+        /// receiver in a blocking [`container_steps::StdinSource`] drained by
+        /// the exec's stdin-forwarder thread. An empty chunk or a closed
+        /// channel is end-of-input. On a callback-mode runtime (no
+        /// `WslcGetProcessIOHandle`) the receiver is dropped unread.
+        stdin: mpsc::Receiver<Vec<u8>>,
         admit: oneshot::Sender<Result<(), WorkerError>>,
         done: oneshot::Sender<Result<i32, WorkerError>>,
     },
@@ -166,6 +173,14 @@ const LIVE_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// ~4x expansion), so a large callback can never overflow a frame and abort the
 /// stream before its terminal frame.
 const LIVE_OUTPUT_MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bound on unconsumed client-stdin chunks buffered between the pipe handler
+/// and the exec's stdin-forwarder thread. Bounded for the same reason as the
+/// output channel: a client force-feeding stdin faster than the container
+/// process drains it must not grow daemon memory without limit. When full, the
+/// pipe handler's dedicated stdin task awaits capacity — backpressuring only
+/// the client's stdin stream, never the output pump.
+const STDIN_CHANNEL_CAPACITY: usize = 16;
 
 /// Enqueue an SDK output callback, splitting it into `LIVE_OUTPUT_MAX_CHUNK_BYTES`
 /// pieces so each queue entry and its resulting frame stay bounded regardless of
@@ -213,6 +228,13 @@ pub struct ExecStream {
     pub done: oneshot::Receiver<Result<i32, WorkerError>>,
     pub output: mpsc::Receiver<OutputChunk>,
     pub overflowed: Arc<AtomicBool>,
+    /// Feed for client stdin chunks (issue #804): the pipe handler sends each
+    /// decoded `StreamFrame::Stdin` payload here; an empty payload is the EOF
+    /// sentinel, and dropping the sender likewise ends input. The channel is
+    /// bounded so a client cannot buffer unbounded stdin in the daemon; `send`
+    /// backpressure never stalls output (the pipe handler pumps stdin from a
+    /// separate task).
+    pub stdin: mpsc::Sender<Vec<u8>>,
 }
 
 /// A cheap, clonable handle async tasks use to drive the worker thread.
@@ -262,9 +284,13 @@ impl SessionHandle {
         let sink: OutputSink = Box::new(move |kind, bytes| {
             enqueue_output(&stream_tx, &sink_overflowed, kind, bytes);
         });
+        // Bounded stdin feed: caps in-daemon buffering of client stdin (chunks
+        // are pump-sized, so capacity 16 keeps at most ~128 KiB in flight).
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_CAPACITY);
         self.send(WorkerCommand::Exec {
             config,
             sink,
+            stdin: stdin_rx,
             admit,
             done,
         })?;
@@ -273,6 +299,7 @@ impl SessionHandle {
             done: done_rx,
             output,
             overflowed,
+            stdin: stdin_tx,
         })
     }
 
@@ -337,6 +364,12 @@ struct Worker {
     containers: HashMap<String, ContainerEntry>,
     session: Option<WslcSessionGuard>,
     sdk: Option<WslcSdk>,
+    /// Cached result of [`container_steps::probe_process_io_handles`]: whether
+    /// this runtime supports handle-mode exec I/O (stdin forwarding, issue
+    /// #804). Probed once on the first exec (the capability is a property of
+    /// the loaded `wslcsdk.dll`, not of any one container) and reused for the
+    /// daemon's lifetime.
+    handle_io: Option<bool>,
 }
 
 impl Worker {
@@ -346,6 +379,7 @@ impl Worker {
             sdk: None,
             session: None,
             containers: HashMap::new(),
+            handle_io: None,
         }
     }
 
@@ -480,7 +514,27 @@ impl Worker {
         config: ExecConfig,
         container: WslcContainer,
         sink: OutputSink,
+        stdin: mpsc::Receiver<Vec<u8>>,
     ) -> Result<i32, WorkerError> {
+        // One-time handle-mode capability probe (issue #804), cached for the
+        // daemon's lifetime — see [`Worker::handle_io`]. Run against this
+        // (validated, started) container; the capability is runtime-wide.
+        if self.handle_io.is_none() {
+            let sdk = self
+                .sdk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no active WSLc session"))?;
+            // SAFETY: `sdk` is valid and `container` is a live, started handle.
+            let supported =
+                unsafe { container_steps::probe_process_io_handles(sdk, container, &mut self.logger) };
+            self.handle_io = Some(supported);
+        }
+        let io_mode = if self.handle_io == Some(true) {
+            container_steps::ExecIoMode::Handles
+        } else {
+            container_steps::ExecIoMode::Callbacks
+        };
+
         let sdk = self
             .sdk
             .as_ref()
@@ -493,6 +547,13 @@ impl Worker {
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
+        // Blocking pull adapter over the async stdin feed; invoked only from
+        // the exec's dedicated stdin-forwarder thread (never this worker
+        // thread, never the async runtime), so `blocking_recv` is sound here.
+        let mut stdin = stdin;
+        let stdin_source: container_steps::StdinSource =
+            Box::new(move || stdin.blocking_recv());
+
         // SAFETY: `sdk` is valid and `container` is a live, started handle.
         let outcome = unsafe {
             container_steps::exec_in_container(
@@ -503,6 +564,8 @@ impl Worker {
                 &config.working_directory,
                 config.timeout_ms,
                 Some(sink),
+                Some(stdin_source),
+                io_mode,
                 &mut self.logger,
             )
         }
@@ -645,6 +708,7 @@ pub fn spawn() -> Result<SessionHandle> {
                     WorkerCommand::Exec {
                         config,
                         sink,
+                        stdin,
                         admit,
                         done,
                     } => {
@@ -661,7 +725,7 @@ pub fn spawn() -> Result<SessionHandle> {
                             // every other lifecycle command for its full timeout.
                             Ok(container) if admit.send(Ok(())).is_ok() => {
                                 let sandbox_id = config.sandbox_id.clone();
-                                let outcome = worker.exec(config, container, sink);
+                                let outcome = worker.exec(config, container, sink, stdin);
                                 if let Err(orphaned) = done.send(outcome) {
                                     // The client handler is gone (e.g. its
                                     // post-admission Ok write failed) but the run
